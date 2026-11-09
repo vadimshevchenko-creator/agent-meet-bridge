@@ -16,6 +16,25 @@ test("wake-name matching respects word boundaries and case", () => {
   assert.equal(utteranceAddressesAgent("the grok botanical demo", "Grok Bot"), false);
 });
 
+test("wake-name aliases match Cyrillic spellings and inflections", () => {
+  const aliases = ["Клод", "Клауд"];
+  assert.equal(utteranceAddressesAgent("Клод, ти розумієш українську?", "Claude", aliases), true);
+  assert.equal(utteranceAddressesAgent("Клоде, що ти знаєш про проєкт?", "Claude", aliases), true);
+  assert.equal(utteranceAddressesAgent("клауд расскажи", "Claude", aliases), true);
+  assert.equal(utteranceAddressesAgent("Клодовые данные", "Claude", aliases), false);
+  assert.equal(utteranceAddressesAgent("Клод, привет", "Claude", []), false);
+});
+
+test("follow-up cues and dismissals cover Ukrainian and Russian", () => {
+  assert.equal(isFollowupCue("А что с API?"), true);
+  assert.equal(isFollowupCue("Що ти знаєш про проєкт?"), true);
+  assert.equal(isFollowupCue("Чи є тести?"), true);
+  assert.equal(isFollowupCue("Андрей уже сделал"), false);
+  assert.equal(isFollowupCue("Проєкт готовий."), false);
+  assert.equal(isDismissal("Клод, я не тебе"), true);
+  assert.equal(isDismissal("не відповідай"), true);
+});
+
 test("passive follow-up cues exclude explicit dismissals", () => {
   assert.equal(isFollowupCue("What about the plugin?"), true);
   assert.equal(isFollowupCue("The plugin is ready."), false);
