@@ -4,6 +4,7 @@ import { chromium } from "playwright";
 const AUDIO_SAMPLE_RATE = 48_000;
 const CAPTION_SETTLE_MS = 1_600;
 const CAPTION_SENT_DEDUPE_WINDOW_MS = 8_000;
+const HOST_ADMISSION_TIMEOUT_MS = 3 * 60_000;
 const MEET_BROWSER_ARGS = Object.freeze([
   "--use-fake-ui-for-media-stream",
   "--autoplay-policy=no-user-gesture-required",
@@ -113,6 +114,63 @@ function isKnownMeetChromeCaption(speaker, text) {
     /^radio_button_checked$/i.test(normalize(speaker)) &&
     /^This meeting is being recorded\.?$/i.test(normalize(text))
   );
+}
+
+function captionControlStateFromSnapshot({ ariaLabel = "", title = "", text = "" } = {}) {
+  const label = `${ariaLabel} ${title}`.replace(/\s+/g, " ").trim();
+  const token = String(text).replace(/\s+/g, " ").trim().toLowerCase();
+  const turnOn = [
+    /\bturn on captions\b/i,
+    /\bshow captions\b/i,
+    /увімкнути субтитри/iu,
+    /показати субтитри/iu,
+    /включить субтитры/iu,
+    /показать субтитры/iu,
+  ];
+  const turnOff = [
+    /\bturn off captions\b/i,
+    /\bhide captions\b/i,
+    /вимкнути субтитри/iu,
+    /сховати субтитри/iu,
+    /отключить субтитры/iu,
+    /скрыть субтитры/iu,
+  ];
+
+  if (turnOff.some((pattern) => pattern.test(label))) return "on";
+  if (turnOn.some((pattern) => pattern.test(label))) return "off";
+  if (/^closed_caption_off$/i.test(token)) return "off";
+  if (/^closed_caption$/i.test(token)) return "on";
+  return null;
+}
+
+function isCaptionSpeechText(value) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text || text.length > 400 || !/[\p{L}\p{N}]/u.test(text)) return false;
+  if (/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/i.test(text)) return false;
+  return !/^(?:settings|mic|camera|people|chat|captions?|more|close|expand|collapse)$/i.test(text);
+}
+
+function captionHealthFromSnapshot({
+  captionState = "unknown",
+  audioFrames = 0,
+  audibleFrames = 0,
+  observedTextNodes = 0,
+  emittedCaptions = 0,
+} = {}) {
+  if (emittedCaptions > 0) return { code: "healthy", message: "speech captions are being received" };
+  if (captionState !== "on") {
+    return { code: "missing-captions", message: "captions are not confirmed enabled" };
+  }
+  if (audioFrames === 0) {
+    return { code: "missing-audio", message: "no remote audio frames have reached the browser bridge" };
+  }
+  if (audibleFrames === 0) {
+    return { code: "silent-audio", message: "remote audio frames are present but contain no audible samples" };
+  }
+  if (observedTextNodes > 0) {
+    return { code: "failed-extraction", message: "Meet DOM text changed but no speech caption was extracted" };
+  }
+  return { code: "missing-captions", message: "audio is audible but Meet has not rendered caption text" };
 }
 
 function captionCandidateOnSpeakerChange(pendingCandidate, nextSpeaker) {
@@ -319,14 +377,21 @@ const AUDIO_BRIDGE_SCRIPT = String.raw`
     const mergeIncremental = ${mergeIncrementalCaption.toString()};
     const matchesExpectedSpeech = ${captionMatchesExpectedSpeech.toString()};
     const matchesMeetChromeCaption = ${isKnownMeetChromeCaption.toString()};
+    const isSpeechText = ${isCaptionSpeechText.toString()};
     const candidateOnSpeakerChange = ${captionCandidateOnSpeakerChange.toString()};
     const keyWasRecentlySent = ${captionKeyWasRecentlySent.toString()};
     window.__meetingAgentExpectedSpeech = window.__meetingAgentExpectedSpeech ?? [];
+    window.__meetingAgentCaptionStats = {
+      observedTextNodes: 0,
+      rejectedTextNodes: 0,
+      emittedCaptions: 0,
+    };
     const emitCandidate = (candidate) => {
       const emittedAt = Date.now();
       if (!candidate || keyWasRecentlySent(candidate.key, lastSent, lastSentAt, emittedAt, ${CAPTION_SENT_DEDUPE_WINDOW_MS})) return;
       lastSent = candidate.key;
       lastSentAt = emittedAt;
+      window.__meetingAgentCaptionStats.emittedCaptions += 1;
       window.__meetingAgentCaptionIn?.({ speaker: candidate.speaker, text: candidate.text });
     };
     const inferSpeaker = (node, text) => {
@@ -346,6 +411,7 @@ const AUDIO_BRIDGE_SCRIPT = String.raw`
     };
     const queueText = (rawText, node) => {
       const text = rawText?.replace(/\s+/g, " ").trim();
+      window.__meetingAgentCaptionStats.observedTextNodes += 1;
       const speaker = inferSpeaker(node, text);
       const agentName = normalize(window.__meetingAgentDisplayName);
       const normalizedSpeaker = normalize(speaker);
@@ -360,14 +426,16 @@ const AUDIO_BRIDGE_SCRIPT = String.raw`
       const matchesAgentSpeech = window.__meetingAgentExpectedSpeech
         .some((entry) => matchesExpectedSpeech(text, entry.text));
       if (
-        !text ||
-        text.length > 400 ||
+        !isSpeechText(text) ||
         isAgentCaption ||
         matchesAgentSpeech ||
         matchesMeetChromeCaption(speaker, text) ||
         ignoredCaptionText.test(text) ||
         /more_vert|visual_effects|frame_person|devices/i.test(text)
-      ) return;
+      ) {
+        window.__meetingAgentCaptionStats.rejectedTextNodes += 1;
+        return;
+      }
       if (speaker !== "Meeting") lastHumanSpeaker = speaker;
       const effectiveSpeaker = speaker === "Meeting" ? lastHumanSpeaker : speaker;
       const previousSpeakerCandidate = candidateOnSpeakerChange(lastCandidate, effectiveSpeaker);
@@ -462,6 +530,42 @@ const AUDIO_BRIDGE_SCRIPT = String.raw`
 })();
 `;
 
+async function findCaptionControl(page, state) {
+  const controls = page.locator('button, [role="button"]');
+  const count = await controls.count();
+  let hiddenMatch = null;
+  for (let index = 0; index < count; index += 1) {
+    const control = controls.nth(index);
+    const snapshot = await control.evaluate((element) => ({
+      ariaLabel: element.getAttribute("aria-label") ?? "",
+      title: element.getAttribute("data-tooltip") ?? element.getAttribute("title") ?? "",
+      text: element.textContent ?? "",
+    })).catch(() => null);
+    if (captionControlStateFromSnapshot(snapshot ?? {}) !== state) continue;
+    if (await control.isVisible().catch(() => false)) return control;
+    hiddenMatch ??= control;
+  }
+  return hiddenMatch;
+}
+
+async function ensureMeetCaptions(page, logger) {
+  if (await findCaptionControl(page, "on")) return "on";
+
+  const offControl = await findCaptionControl(page, "off");
+  if (offControl) {
+    await offControl.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(750);
+    if (await findCaptionControl(page, "on")) return "on";
+  }
+
+  await page.keyboard.press("c").catch(() => {});
+  await page.waitForTimeout(750);
+  if (await findCaptionControl(page, "on")) return "on";
+
+  logger.warn?.("[meet][captions] enablement failed: no enabled caption control was detected after click and keyboard fallback");
+  return "unknown";
+}
+
 async function matchingControl(page, name, { requireVisible = true } = {}) {
   const candidates = [
     page.getByRole("button", { name, exact: false }),
@@ -534,9 +638,91 @@ async function waitAndClickDomControl(page, names, timeoutMs) {
   return false;
 }
 
+export function meetingJoinStateFromSnapshot({ bodyText = "", controlTokens = [] } = {}) {
+  const tokens = new Set(controlTokens.map((token) => String(token).trim().toLowerCase()));
+  const hasEndCall = tokens.has("call_end");
+  const hasMediaControl = [
+    "mic",
+    "mic_off",
+    "videocam",
+    "videocam_off",
+    "present_to_all",
+    "closed_caption",
+    "closed_caption_off",
+  ].some((token) => tokens.has(token));
+
+  if (hasEndCall && hasMediaControl) return "in-call";
+
+  const text = String(bodyText).replace(/\s+/g, " ").trim();
+  const waitingForAdmission = [
+    /wait(?:ing)? for (?:the )?(?:host|organizer).*?(?:let|allow).*?(?:join|into)/i,
+    /you(?:'|’)ll join (?:the )?call when someone lets you in/i,
+    /зачекайте,? доки організатор(?: зустрічі)?.*?дозволить вам приєднатися(?: до дзвінка)?/iu,
+    /очікуйте,? доки організатор(?: зустрічі)?.*?дозволить вам приєднатися(?: до дзвінка)?/iu,
+    /подождите,? пока организатор(?: встречи)?.*?разрешит вам присоединиться(?: к звонку)?/iu,
+  ].some((pattern) => pattern.test(text));
+
+  if (waitingForAdmission) return "waiting-admission";
+  if (
+    /Meeting details/i.test(text) && /Share screen/i.test(text)
+    || /Відомості про зустріч/iu.test(text) && /Показати екран/iu.test(text)
+    || /Сведения о встрече/iu.test(text) && /Показать экран/iu.test(text)
+  ) return "in-call";
+
+  return "unknown";
+}
+
+async function meetingJoinState(page) {
+  const snapshot = await page.evaluate(() => {
+    const stableTokens = new Set([
+      "call_end",
+      "mic",
+      "mic_off",
+      "videocam",
+      "videocam_off",
+      "present_to_all",
+      "closed_caption",
+      "closed_caption_off",
+    ]);
+    const controlTokens = [];
+    const controls = document.querySelectorAll('button, [role="button"]');
+
+    for (const control of controls) {
+      const descendants = control.querySelectorAll("i, span, [aria-hidden='true']");
+      for (const descendant of descendants) {
+        const token = descendant.textContent?.trim().toLowerCase();
+        if (stableTokens.has(token)) controlTokens.push(token);
+      }
+    }
+
+    return {
+      bodyText: document.body?.innerText ?? "",
+      controlTokens,
+    };
+  });
+
+  return meetingJoinStateFromSnapshot(snapshot);
+}
+
 async function pageIsInCall(page) {
-  const text = await page.locator("body").innerText().catch(() => "");
-  return text.includes("Meeting details") && text.includes("Share screen");
+  return (await meetingJoinState(page)) === "in-call";
+}
+
+async function waitForHostAdmission(page, logger, timeoutMs = HOST_ADMISSION_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let loggedWaiting = false;
+
+  while (Date.now() < deadline) {
+    const state = await meetingJoinState(page);
+    if (state === "in-call") return true;
+    if (state === "waiting-admission" && !loggedWaiting) {
+      logger.info?.("[meet] waiting for host admission (up to 3 minutes)");
+      loggedWaiting = true;
+    }
+    await page.waitForTimeout(500);
+  }
+
+  return false;
 }
 
 export function meetingPopulationFromSnapshot({ bodyText = "", ariaLabels = [] } = {}) {
@@ -585,7 +771,7 @@ export class BrowserMeetTransport {
     profileDir,
     headless = false,
     browserChannel = "chrome",
-    admissionTimeoutMs = 5 * 60_000,
+    admissionTimeoutMs = HOST_ADMISSION_TIMEOUT_MS,
     aloneTimeoutMs = 5 * 60_000,
     presenceCheckIntervalMs = 5_000,
     logger = console,
@@ -602,7 +788,7 @@ export class BrowserMeetTransport {
     this.profileDir = path.resolve(profileDir);
     this.headless = headless;
     this.browserChannel = browserChannel;
-    this.admissionTimeoutMs = admissionTimeoutMs;
+    this.admissionTimeoutMs = Math.min(admissionTimeoutMs, HOST_ADMISSION_TIMEOUT_MS);
     this.aloneTimeoutMs = aloneTimeoutMs;
     this.presenceCheckIntervalMs = presenceCheckIntervalMs;
     this.logger = logger;
@@ -625,6 +811,12 @@ export class BrowserMeetTransport {
     this.reconnectTimer = null;
     this.reconnecting = false;
     this.presenceCheckPending = false;
+    this.captionState = "unknown";
+    this.audioFrames = 0;
+    this.audibleFrames = 0;
+    this.receivedCaptions = 0;
+    this.mediaDiagnosticTimer = null;
+    this.lastMediaDiagnosticCode = null;
   }
 
   async #checkPresence() {
@@ -685,6 +877,32 @@ export class BrowserMeetTransport {
     this.presenceTimer.unref?.();
   }
 
+  #startMediaDiagnostics() {
+    clearInterval(this.mediaDiagnosticTimer);
+    this.lastMediaDiagnosticCode = null;
+    this.mediaDiagnosticTimer = setInterval(async () => {
+      if (!this.page || this.page.isClosed()) return;
+      const extraction = await this.page.evaluate(() => window.__meetingAgentCaptionStats ?? {})
+        .catch(() => ({}));
+      const health = captionHealthFromSnapshot({
+        captionState: this.captionState,
+        audioFrames: this.audioFrames,
+        audibleFrames: this.audibleFrames,
+        observedTextNodes: extraction.observedTextNodes ?? 0,
+        emittedCaptions: Math.max(this.receivedCaptions, extraction.emittedCaptions ?? 0),
+      });
+      if (health.code === this.lastMediaDiagnosticCode) return;
+      this.lastMediaDiagnosticCode = health.code;
+      const details = `audioFrames=${this.audioFrames} audibleFrames=${this.audibleFrames} observedText=${extraction.observedTextNodes ?? 0} captions=${this.receivedCaptions}`;
+      if (health.code === "healthy") {
+        this.logger.info?.(`[meet][diagnostic] ${health.message}; ${details}`);
+        return;
+      }
+      this.logger.warn?.(`[meet][diagnostic:${health.code}] ${health.message}; ${details}`);
+    }, 15_000);
+    this.mediaDiagnosticTimer.unref?.();
+  }
+
   async join() {
     this.intentionalClose = false;
     await this.#joinOnce();
@@ -730,6 +948,10 @@ export class BrowserMeetTransport {
   }
 
   async #joinOnce() {
+    this.captionState = "unknown";
+    this.audioFrames = 0;
+    this.audibleFrames = 0;
+    this.receivedCaptions = 0;
     const launchOptions = {
       headless: this.headless,
       args: [...MEET_BROWSER_ARGS],
@@ -747,15 +969,28 @@ export class BrowserMeetTransport {
       this.page = null;
       clearInterval(this.presenceTimer);
       this.presenceTimer = null;
+      clearInterval(this.mediaDiagnosticTimer);
+      this.mediaDiagnosticTimer = null;
       this.#scheduleReconnect("browser-closed");
     });
     await this.context.addInitScript({ content: AUDIO_BRIDGE_SCRIPT });
     await this.context.exposeFunction("__meetingAgentAudioIn", async (base64Pcm) => {
-      await this.onAudio?.(Buffer.from(base64Pcm, "base64"));
+      const pcm = Buffer.from(base64Pcm, "base64");
+      this.audioFrames += 1;
+      for (let offset = 0; offset + 1 < pcm.length; offset += 2) {
+        if (Math.abs(pcm.readInt16LE(offset)) < 256) continue;
+        this.audibleFrames += 1;
+        break;
+      }
+      await this.onAudio?.(pcm);
     });
     await this.context.exposeFunction("__meetingAgentCaptionIn", async (caption) => {
       this.seenOthers = true;
       this.aloneSince = null;
+      this.receivedCaptions += 1;
+      this.logger.debug?.(
+        `[meet][captions] received speech caption #${this.receivedCaptions} (${caption.text.length} chars)`,
+      );
       await this.onCaption?.(caption);
     });
     await this.context.exposeFunction("__meetingAgentPeerIn", async () => {
@@ -796,7 +1031,6 @@ export class BrowserMeetTransport {
     await clickDomControl(this.page, ["Not now"]);
     await clickDomControl(this.page, ["Turn off camera"]);
     await clickDomControl(this.page, ["Turn on microphone"]);
-    const leaveNames = ["Leave call", "Hang up", "End call"];
     const joinNames = [
       "Switch here",
       "Join here too",
@@ -804,33 +1038,38 @@ export class BrowserMeetTransport {
       "Join now",
       "Join meeting",
       "Rejoin",
+      "Надіслати запит на приєднання",
+      "Попросити приєднатися",
+      "Приєднатися",
+      "Попросить разрешения присоединиться",
+      "Присоединиться",
     ];
-    let leave = await waitForButton(this.page, leaveNames, 1_500, { requireVisible: false });
-    if (!leave && (await pageIsInCall(this.page))) leave = true;
-    if (!leave) {
+    let admitted = await pageIsInCall(this.page);
+    let state = admitted ? "in-call" : await meetingJoinState(this.page);
+
+    if (!admitted && state === "waiting-admission") {
+      admitted = await waitForHostAdmission(this.page, this.logger, this.admissionTimeoutMs);
+    }
+
+    if (!admitted && state !== "waiting-admission") {
       const join = await waitForButton(this.page, joinNames, 15_000);
       if (!join) {
-        const pageText = (await this.page.locator("body").innerText()).replace(/\s+/g, " ").slice(0, 500);
-        throw new Error(`Google Meet join button was not found. Page: ${pageText}`);
-      }
-      await join.click({ force: true });
-      await this.page.waitForTimeout(5_000);
-      leave = await waitForButton(this.page, leaveNames, 2_000, {
-        requireVisible: false,
-      });
-      if (!leave && (await pageIsInCall(this.page))) leave = true;
-      const stillPrejoin = !leave && (await waitForButton(this.page, joinNames, 1_000));
-      if (stillPrejoin) {
-        await stillPrejoin.click({ force: true });
-        await this.page.waitForTimeout(5_000);
-        leave = await waitForButton(this.page, leaveNames, 2_000, { requireVisible: false });
-        if (!leave && (await waitForButton(this.page, joinNames, 1_000))) {
-          throw new Error("Google Meet remained on the pre-join screen after two trusted Join clicks");
+        state = await meetingJoinState(this.page);
+        if (state === "in-call") admitted = true;
+        else if (state === "waiting-admission") {
+          admitted = await waitForHostAdmission(this.page, this.logger, this.admissionTimeoutMs);
+        } else {
+          const pageText = (await this.page.locator("body").innerText()).replace(/\s+/g, " ").slice(0, 500);
+          throw new Error(`Google Meet join button was not found. Page: ${pageText}`);
         }
+      } else {
+        await join.click({ force: true });
+        admitted = await waitForHostAdmission(this.page, this.logger, this.admissionTimeoutMs);
       }
     }
-    if (!leave) {
-      this.logger.warn?.("Meet did not expose an in-call toolbar; continuing while admission settles.");
+
+    if (!admitted) {
+      throw new Error("Google Meet host did not admit the bot within 3 minutes");
     }
     const cameraIsOn = await matchingControl(this.page, "Turn off camera", {
       requireVisible: false,
@@ -844,27 +1083,17 @@ export class BrowserMeetTransport {
     });
     if (cameraStillOn) throw new Error("Google Meet camera could not be turned off");
     await this.page.evaluate(() => window.__meetingAgentStartCapture());
-    let captionsAlreadyOn = await matchingControl(this.page, "Turn off captions", {
-      requireVisible: false,
-    });
-    if (!captionsAlreadyOn) {
-      const captionsButton = await matchingControl(this.page, "Turn on captions", {
-        requireVisible: false,
-      });
-      if (captionsButton) await captionsButton.click({ force: true });
-      else await this.page.keyboard.press("c");
-      await this.page.waitForTimeout(1_000);
-      captionsAlreadyOn = await matchingControl(this.page, "Turn off captions", {
-        requireVisible: false,
-      });
-    }
-    if (!captionsAlreadyOn) this.logger.warn?.("Meet captions could not be confirmed as enabled.");
     await this.page.evaluate(() => window.__meetingAgentStartCaptions());
+    this.captionState = await ensureMeetCaptions(this.page, this.logger);
+    if (this.captionState === "on") {
+      this.logger.info?.("[meet][captions] enabled and extraction observer is active");
+    }
     const sampleRate = await this.page.evaluate(() => window.__meetingAgentSampleRate);
     if (sampleRate !== AUDIO_SAMPLE_RATE) {
       throw new Error(`Chromium opened audio at ${sampleRate} Hz; ${AUDIO_SAMPLE_RATE} Hz is required`);
     }
     this.#startPresenceMonitor();
+    this.#startMediaDiagnostics();
   }
 
   async playAudio(pcmBytes, sampleRate = AUDIO_SAMPLE_RATE) {
@@ -899,6 +1128,8 @@ export class BrowserMeetTransport {
     this.reconnectTimer = null;
     clearInterval(this.presenceTimer);
     this.presenceTimer = null;
+    clearInterval(this.mediaDiagnosticTimer);
+    this.mediaDiagnosticTimer = null;
     try {
       await clickButton(this.page, ["Leave call", "Hang up", "End call"]);
     } finally {
@@ -956,10 +1187,14 @@ export {
   AUDIO_SAMPLE_RATE,
   CAPTION_SETTLE_MS,
   CAPTION_SENT_DEDUPE_WINDOW_MS,
+  HOST_ADMISSION_TIMEOUT_MS,
   MEET_BROWSER_ARGS,
   captionCandidateOnSpeakerChange,
+  captionControlStateFromSnapshot,
+  captionHealthFromSnapshot,
   captionKeyWasRecentlySent,
   captionMatchesExpectedSpeech,
+  isCaptionSpeechText,
   isKnownMeetChromeCaption,
   mergeIncrementalCaption,
 };

@@ -243,3 +243,23 @@ test("distinct ambient speech remains available to the transcript", async () => 
   ]);
   assert.equal(turns.length, 0);
 });
+
+test("multilingual addressed Meet captions reach the active-mode conversation handler", async () => {
+  const turns = [];
+  const runtime = captionTestRuntime({
+    mode: "active",
+    onUserTurn: (turn) => {
+      turns.push(turn);
+      return "";
+    },
+  });
+
+  runtime.appendCaption({ speaker: "Олена", text: "John, ти мене чуєш?" });
+  runtime.appendCaption({ speaker: "Анна", text: "John, ты меня слышишь?" });
+  await flushCaptionRuntime(runtime);
+
+  assert.deepEqual(turns.map((turn) => turn.text), [
+    "John, ти мене чуєш?",
+    "John, ты меня слышишь?",
+  ]);
+});

@@ -2,3 +2,23 @@
 !.env.example
 data/
 node_modules/
+
+# Local env backups
+.env.*
+!.env.example
+
+# Chrome profile files written to the repo root when MEETING_AGENT_PROFILE_DIR was empty
+/ChromeFeatureState
+/Default/
+/GPUPersistentCache/
+/GraphiteDawnCache/
+/Last Version
+/Local State
+/NativeMessagingHosts/
+/OptimizationGuideModelsManifest/
+/Safe Browsing/
+/Variations
+/VariationsSafeSeedV2
+/VariationsSeedV2
+/component_crx_cache/
+/segmentation_platform/

@@ -8,12 +8,17 @@ import {
   BrowserMeetTransport,
   CAPTION_SETTLE_MS,
   CAPTION_SENT_DEDUPE_WINDOW_MS,
+  HOST_ADMISSION_TIMEOUT_MS,
   MEET_BROWSER_ARGS,
   captionCandidateOnSpeakerChange,
+  captionHealthFromSnapshot,
+  captionControlStateFromSnapshot,
   captionKeyWasRecentlySent,
   captionMatchesExpectedSpeech,
+  isCaptionSpeechText,
   isKnownMeetChromeCaption,
   meetingPopulationFromSnapshot,
+  meetingJoinStateFromSnapshot,
   mergeIncrementalCaption,
   nextMeetingPresence,
 } from "../src/browser-meet-transport.mjs";
@@ -32,6 +37,33 @@ test("local Meet transport keeps a dedicated persistent browser profile", () => 
   });
   assert.equal(transport.displayName, "Grok Bot");
   assert.equal(transport.profileDir, path.resolve("./data/browser-profile"));
+});
+
+test("Meet join detection recognizes an existing call from stable control tokens", () => {
+  assert.equal(
+    meetingJoinStateFromSnapshot({
+      bodyText: "Відомості про зустріч Учасники: 2",
+      controlTokens: ["mic_off", "videocam_off", "call_end"],
+    }),
+    "in-call",
+  );
+});
+
+test("Meet join detection recognizes host-admission waiting in supported languages", () => {
+  const waitingMessages = [
+    "Wait for the host to let you into the call",
+    "Зачекайте, доки організатор зустрічі дозволить вам приєднатися до дзвінка",
+    "Подождите, пока организатор встречи разрешит вам присоединиться к звонку",
+  ];
+
+  for (const bodyText of waitingMessages) {
+    assert.equal(
+      meetingJoinStateFromSnapshot({ bodyText }),
+      "waiting-admission",
+      bodyText,
+    );
+  }
+  assert.equal(HOST_ADMISSION_TIMEOUT_MS, 3 * 60_000);
 });
 
 test("bot capture does not use Chrome mute-audio, which zeros WebRTC samples", () => {
@@ -103,6 +135,56 @@ test("caption capture records ambient speech instead of requiring the wake name"
   assert.match(source, /isAgentCaption/);
   assert.match(source, /wakeBuffer/);
   assert.match(source, /mergeIncremental/);
+});
+
+test("caption controls are recognized in English, Ukrainian, and Russian", () => {
+  const controls = [
+    [{ ariaLabel: "Turn on captions" }, "off"],
+    [{ ariaLabel: "Turn off captions" }, "on"],
+    [{ ariaLabel: "Увімкнути субтитри" }, "off"],
+    [{ ariaLabel: "Вимкнути субтитри" }, "on"],
+    [{ ariaLabel: "Включить субтитры" }, "off"],
+    [{ ariaLabel: "Отключить субтитры" }, "on"],
+    [{ text: "closed_caption_off" }, "off"],
+    [{ text: "closed_caption" }, "on"],
+  ];
+
+  for (const [snapshot, expected] of controls) {
+    assert.equal(captionControlStateFromSnapshot(snapshot), expected, JSON.stringify(snapshot));
+  }
+  assert.equal(captionControlStateFromSnapshot({ ariaLabel: "Settings", text: "settings" }), null);
+});
+
+test("caption extraction rejects Meet toolbar glyphs but accepts multilingual speech", () => {
+  for (const token of ["mic_off", "settings", "keyboard_arrow_down", "closed_caption", "more_vert"]) {
+    assert.equal(isCaptionSpeechText(token), false, token);
+  }
+  for (const speech of [
+    "John, can you hear me?",
+    "Джоне, ти мене чуєш?",
+    "Джон, ты меня слышишь?",
+  ]) {
+    assert.equal(isCaptionSpeechText(speech), true, speech);
+  }
+});
+
+test("caption diagnostics distinguish disabled captions, missing audio, and extraction failure", () => {
+  assert.equal(captionHealthFromSnapshot({ captionState: "unknown" }).code, "missing-captions");
+  assert.equal(captionHealthFromSnapshot({ captionState: "on", audioFrames: 0 }).code, "missing-audio");
+  assert.equal(
+    captionHealthFromSnapshot({
+      captionState: "on",
+      audioFrames: 12,
+      audibleFrames: 4,
+      observedTextNodes: 8,
+      emittedCaptions: 0,
+    }).code,
+    "failed-extraction",
+  );
+  assert.equal(
+    captionHealthFromSnapshot({ captionState: "on", audioFrames: 12, audibleFrames: 4, emittedCaptions: 1 }).code,
+    "healthy",
+  );
 });
 
 test("caption settling flushes a pending candidate before a different speaker arrives", () => {
